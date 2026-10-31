@@ -1,0 +1,10 @@
+{
+  "name": "cozmo-game-server",
+  "version": "1.0.0",
+  "description": "Relay server for Cozmo multiplayer rooms. No dependencies.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=16" },
+  "license": "UNLICENSED",
+  "private": true
+}
