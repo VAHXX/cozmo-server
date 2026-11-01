@@ -153,13 +153,15 @@ class Client {
 
 function log(s) { console.log(new Date().toISOString().slice(11, 19) + '  ' + s); }
 
+const api = require('./api');
 const server = http.createServer((req, res) => {
+  if (req.url.split('?')[0] === '/api') return api.handle(req, res);
   res.setHeader('Access-Control-Allow-Origin', '*');
   if (req.url === '/status') {
     const out = {}; rooms.forEach(r => { (out[r.game] = out[r.game] || []).push({ id: r.id, players: r.players.size, max: MAX_PLAYERS }); });
     res.setHeader('Content-Type', 'application/json'); return res.end(JSON.stringify(out));
   }
-  res.setHeader('Content-Type', 'text/plain'); res.end('Cozmo game server is running.\n');
+  res.setHeader('Content-Type', 'text/plain'); res.end('Cozmo game server is running. Storage: ' + api.db.mode + '\n');
 });
 server.on('upgrade', (req, socket) => {
   const key = req.headers['sec-websocket-key'];
