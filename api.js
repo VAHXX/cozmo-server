@@ -103,6 +103,18 @@ const fails = {};
 function tooMany(key) { const f = fails[key]; return f && f.n >= 8 && Date.now() - f.t < 600000; }
 function noteFail(key) { const f = fails[key] || (fails[key] = { n: 0, t: 0 }); if (Date.now() - f.t > 600000) f.n = 0; f.n++; f.t = Date.now(); }
 
+/* Who is banned / admin. Cached for a few seconds so every request does not hit the database. */
+const infoCache = {};
+const hooks = { onBan: null };
+async function acctInfo(key) {
+  const c = infoCache[key]; if (c && Date.now() - c.t < 10000) return c.v;
+  const a = await db.get('accounts/' + key);
+  const v = a ? { key, name: a.name, ban: a.ban ? 1 : 0, adm: (key === ADMIN_KEY || a.adm) ? 1 : 0, owner: key === ADMIN_KEY ? 1 : 0 } : null;
+  infoCache[key] = { t: Date.now(), v }; return v;
+}
+function forget(key) { delete infoCache[key]; }
+async function authInfo(token) { const k = checkToken(token); if (!k) return null; const i = await acctInfo(k); return i && !i.ban ? i : null; }
+
 /* One write at a time, so numbering and name checks cannot race */
 let chain = Promise.resolve();
 function locked(fn) { const p = chain.then(fn, fn); chain = p.catch(() => {}); return p; }
@@ -123,7 +135,8 @@ const ops = {
     if (acct) {
       const h = await scrypt(pw, Buffer.from(acct.salt, 'hex'));
       if (h !== acct.hash) { noteFail(key); return { err: m.create ? 'That username is taken online with a different password.' : 'Wrong password.' }; }
-      return { token: makeToken(key), name: acct.name, adm: key === ADMIN_KEY ? 1 : 0 };
+      if (acct.ban) return { err: 'This account is banned.', banned: 1 };
+      return { token: makeToken(key), name: acct.name, adm: (key === ADMIN_KEY || acct.adm) ? 1 : 0 };
     }
     if (!m.create) return { err: 'noacct' };
     return locked(async () => {
@@ -138,11 +151,16 @@ const ops = {
   async pull(m) {
     const since = Math.max(0, Math.floor(+m.since || 0)), have = (m.have && typeof m.have === 'object' && !Array.isArray(m.have)) ? m.have : {};
     const out = { items: [], delItems: [], games: [], gameIds: [], groups: [], deleted: [] };
+    const who = checkToken(m.token);
+    if (who) { const inf = await acctInfo(who); if (inf) { if (inf.ban) out.banned = 1; else out.adm = inf.adm; } }
+    await seedHammer();
+    const tomb = Array.isArray(m.tomb) ? m.tomb.map(x => Math.floor(+x)).filter(x => x > 0) : [];
     const items = (await db.get('items')) || {};
     Object.keys(items).forEach(k => {
       const it = items[k], seq = +k.slice(1);
       if (it.del) out.delItems.push(seq);
-      if (seq > since) out.items.push({ seq, n: it.n || '', c: it.c || '', p: it.p || 0, d: it.d || '', col: it.col || '', dsn: it.dsn || '', by: it.by || '', del: it.del ? 1 : 0 });
+      /* new items, and items an admin brought back that this device still has as removed */
+      if (seq > since || (!it.del && tomb.indexOf(seq) >= 0)) out.items.push({ seq, n: it.n || '', c: it.c || '', p: it.p || 0, d: it.d || '', col: it.col || '', dsn: it.dsn || '', by: it.by || '', ao: it.ao ? 1 : 0, del: it.del ? 1 : 0 });
     });
     out.items.sort((a, b) => a.seq - b.seq);
     const games = (await db.get('games')) || {};
@@ -153,57 +171,59 @@ const ops = {
     return out;
   },
 
-  async addItem(m, who) {
+  async addItem(m, who, adm) {
     const u = m.item || {};
     return locked(async () => {
       const seqN = ((await db.get('meta/seq')) || 0) + 1, id = 'i' + seqN;
       if (u.del) { await db.set('items/' + id, { del: 1 }); await db.set('meta/seq', seqN); return { seq: seqN }; }
-      const isAdm = who === ADMIN_KEY, n = clean(u.n, 30).trim(), c = clean(u.c, 12);
+      const isAdm = !!adm, n = clean(u.n, 30).trim(), c = clean(u.c, 12);
       if (!n) return { err: 'Give your item a name.' };
       if ((isAdm ? ALL_CATS : SAFE_CATS).indexOf(c) < 0) return { err: 'You can only make shirts, t-shirts and pants.' };
       const p = Math.floor(+u.p); if (isNaN(p) || p < 0 || p > 9999) return { err: 'Price must be 0 to 9999.' };
       const all = (await db.get('items')) || {};
-      for (const k in all) { if (all[k].n && all[k].n.toLowerCase() === n.toLowerCase()) return { err: 'An item with that name already exists.', dup: +k.slice(1) }; }
+      for (const k in all) { if (!all[k].del && all[k].n && all[k].n.toLowerCase() === n.toLowerCase()) return { err: 'An item with that name already exists.', dup: +k.slice(1) }; }
       const acct = await db.get('accounts/' + who);
       await db.set('items/' + id, { n, c, p, d: clean(u.d, 120), col: clean(u.col, 9), dsn: clean(u.dsn, 12), by: acct ? acct.name : who, bk: who });
       await db.set('meta/seq', seqN);
       return { seq: seqN };
     });
   },
-  async delItem(m, who) {
+  async delItem(m, who, adm) {
     const seq = Math.floor(+m.seq), id = 'i' + seq;
     return locked(async () => {
       const it = await db.get('items/' + id); if (!it) return { err: 'No such item.' };
       if (it.del) return { ok: 1 };
       const acct = await db.get('accounts/' + who);
-      if (who !== ADMIN_KEY && !(it.bk === who || (acct && it.by === acct.name))) return { err: 'You can only delete your own items.' };
-      await db.set('items/' + id, { del: 1 }); return { ok: 1 };
+      if (!adm && !(it.bk === who || (acct && it.by === acct.name))) return { err: 'You can only delete your own items.' };
+      if (it.ao && !adm) return { err: 'You cannot delete that.' };
+      it.del = 1; await db.set('items/' + id, it); return { ok: 1 };   /* kept, so an admin can bring it back */
     });
   },
 
-  async putGame(m, who) {
+  async putGame(m, who, adm) {
     const g = m.game || {};
     if (!okId(g.id)) return { err: 'Bad game.' };
     const text = JSON.stringify(g); if (text.length > 700000) return { err: 'That game is too big to share.' };
     const old = await db.get('games/' + g.id), oldG = old && jparse(old.j);
     if (await db.get('deleted/' + g.id)) return { err: 'deleted' };
-    if (who !== ADMIN_KEY && (g.byKey !== who || (oldG && oldG.byKey !== who))) return { err: 'That game belongs to someone else.' };
-    const ts = Date.now(); await db.set('games/' + g.id, { j: text, ts }); return { ok: 1, ts };
+    if (!adm && (g.byKey !== who || (oldG && oldG.byKey !== who))) return { err: 'That game belongs to someone else.' };
+    const ts = Date.now(); await db.set('games/' + g.id, { j: text, ts, n: clean(g.n, 40), by: clean(g.by, 16) }); return { ok: 1, ts };
   },
-  async delGame(m, who) {
+  async delGame(m, who, adm) {
     if (!okId(m.id)) return { err: 'Bad id.' };
     const old = await db.get('games/' + m.id), g = old && jparse(old.j);
-    if (g && who !== ADMIN_KEY && g.byKey !== who) return { err: 'That game belongs to someone else.' };
+    if (g && !adm && g.byKey !== who) return { err: 'That game belongs to someone else.' };
+    if (old) await db.set('trash/games/' + m.id, old);   /* kept, so an admin can bring it back */
     await db.del('games/' + m.id); await db.set('deleted/' + m.id, 1); return { ok: 1 };
   },
 
-  async putGroup(m, who) {
+  async putGroup(m, who, adm) {
     const g = m.group || {};
     if (!okId(g.id)) return { err: 'Bad group.' };
     const old = await db.get('groups/' + g.id);
     if (await db.get('deleted/' + g.id)) return { err: 'deleted' };
-    if (old && who !== ADMIN_KEY && old.ownerKey !== who) return { err: 'That group belongs to someone else.' };
-    if (!old && g.ownerKey !== who && who !== ADMIN_KEY) return { err: 'Bad owner.' };
+    if (old && !adm && old.ownerKey !== who) return { err: 'That group belongs to someone else.' };
+    if (!old && g.ownerKey !== who && !adm) return { err: 'Bad owner.' };
     const mem2 = old && old.m ? old.m : {}; mem2[g.ownerKey || who] = 1;
     await db.set('groups/' + g.id, { n: clean(g.n, 30), owner: clean(g.owner, 16), ownerKey: clean(g.ownerKey || who, 16), m: mem2 }); return { ok: 1 };
   },
@@ -211,10 +231,11 @@ const ops = {
     if (!okId(m.id) || !(await db.get('groups/' + m.id))) return { err: 'No such group.' };
     await db.set('groups/' + m.id + '/m/' + who, m.leave ? null : 1); return { ok: 1 };
   },
-  async delGroup(m, who) {
+  async delGroup(m, who, adm) {
     if (!okId(m.id)) return { err: 'Bad id.' };
     const g = await db.get('groups/' + m.id);
-    if (g && who !== ADMIN_KEY && g.ownerKey !== who) return { err: 'That group belongs to someone else.' };
+    if (g && !adm && g.ownerKey !== who) return { err: 'That group belongs to someone else.' };
+    if (g) await db.set('trash/groups/' + m.id, g);
     await db.del('groups/' + m.id); await db.set('deleted/' + m.id, 1); return { ok: 1 };
   },
 
@@ -240,6 +261,84 @@ const ops = {
     return { list: out.slice(0, 20) };
   }
 };
+
+/* The Ban Hammer is added once, by the server. Only admins can get it. */
+let hammerDone = false;
+async function seedHammer() {
+  if (hammerDone) return;
+  await locked(async () => {
+    if (await db.get('meta/hammer')) { hammerDone = true; return; }
+    const seqN = ((await db.get('meta/seq')) || 0) + 1;
+    await db.set('items/i' + seqN, { n: 'Ban Hammer', c: 'Gear', p: 0, d: 'Only admins can use this. Whack a player to ban them.', col: '#4a4a52', dsn: 'hammer', by: 'Cozmo Team', bk: '_cozmo', ao: 1 });
+    await db.set('meta/seq', seqN); await db.set('meta/hammer', seqN); hammerDone = true;
+  });
+}
+
+/* ---------- Admin ---------- */
+async function setAcct(key, patch) {
+  const a = await db.get('accounts/' + key); if (!a) return false;
+  Object.keys(patch).forEach(k => { if (patch[k]) a[k] = 1; else delete a[k]; });
+  await db.set('accounts/' + key, a); forget(key); return true;
+}
+ops.adminList = async function (m, who, adm) {
+  if (!adm) return { err: 'Admins only.' };
+  const out = { players: [], items: [], games: [], groups: [], owner: who === ADMIN_KEY ? 1 : 0 };
+  const accts = (await db.get('accounts')) || {};
+  Object.keys(accts).forEach(k => { const a = accts[k]; out.players.push({ key: k, name: a.name || k, ban: a.ban ? 1 : 0, adm: (k === ADMIN_KEY || a.adm) ? 1 : 0, owner: k === ADMIN_KEY ? 1 : 0 }); });
+  out.players.sort((a, b) => a.name.toLowerCase() < b.name.toLowerCase() ? -1 : 1);
+  const items = (await db.get('items')) || {};
+  Object.keys(items).forEach(k => { const it = items[k]; if (it.n) out.items.push({ seq: +k.slice(1), n: it.n, c: it.c || '', by: it.by || '', del: it.del ? 1 : 0, ao: it.ao ? 1 : 0 }); });
+  out.items.sort((a, b) => b.seq - a.seq);
+  const gm = (await db.get('games')) || {}, gt = (await db.get('trash/games')) || {};
+  [[gm, 0], [gt, 1]].forEach(pair => Object.keys(pair[0]).forEach(id => {
+    const r = pair[0][id]; let n = r.n, by = r.by;
+    if (n === undefined) { const g = jparse(r.j) || {}; n = g.n || g.name || id; by = g.by || ''; }
+    out.games.push({ id, n: n || id, by: by || '', del: pair[1] });
+  }));
+  const gr = (await db.get('groups')) || {}, grt = (await db.get('trash/groups')) || {};
+  [[gr, 0], [grt, 1]].forEach(pair => Object.keys(pair[0]).forEach(id => { const g = pair[0][id]; out.groups.push({ id, n: g.n || id, by: g.owner || '', del: pair[1] }); }));
+  return out;
+};
+ops.admin = async function (m, who, adm) {
+  if (!adm) return { err: 'Admins only.' };
+  const a = String(m.action || ''), owner = who === ADMIN_KEY;
+  if (a === 'ban' || a === 'unban' || a === 'makeAdmin' || a === 'removeAdmin') {
+    const key = String(m.key || '').toLowerCase(); if (!/^[a-z0-9_]{3,16}$/.test(key)) return { err: 'Bad player.' };
+    if (key === ADMIN_KEY) return { err: 'The owner cannot be changed.' };
+    if (a === 'ban') {
+      if (key === who) return { err: 'You cannot ban yourself.' };
+      const t = await acctInfo(key); if (!t) return { err: 'No such player.' };
+      if (t.adm && !owner) return { err: 'Only the owner can ban an admin.' };
+      await setAcct(key, { ban: 1 }); if (hooks.onBan) hooks.onBan(key); return { ok: 1 };
+    }
+    if (a === 'unban') { if (!(await setAcct(key, { ban: 0 }))) return { err: 'No such player.' }; return { ok: 1 }; }
+    if (!owner) return { err: 'Only the owner can make or remove admins.' };
+    if (!(await setAcct(key, { adm: a === 'makeAdmin' ? 1 : 0 }))) return { err: 'No such player.' };
+    return { ok: 1 };
+  }
+  if (a === 'delItem' || a === 'restoreItem') {
+    const id = 'i' + Math.floor(+m.seq);
+    return locked(async () => {
+      const it = await db.get('items/' + id); if (!it || !it.n) return { err: 'No such item.' };
+      if (a === 'delItem') { it.del = 1; await db.set('items/' + id, it); return { ok: 1 }; }
+      const all = (await db.get('items')) || {};
+      for (const k in all) { if (k !== id && !all[k].del && all[k].n && all[k].n.toLowerCase() === it.n.toLowerCase()) return { err: 'Another item already uses that name.' }; }
+      delete it.del; await db.set('items/' + id, it); return { ok: 1 };
+    });
+  }
+  if (a === 'delGame' || a === 'restoreGame' || a === 'delGroup' || a === 'restoreGroup') {
+    if (!okId(m.id)) return { err: 'Bad id.' };
+    const kind = a.slice(-4) === 'Game' ? 'games' : 'groups', id = m.id;
+    if (a.slice(0, 3) === 'del') {
+      const old = await db.get(kind + '/' + id); if (!old) return { ok: 1 };
+      await db.set('trash/' + kind + '/' + id, old); await db.del(kind + '/' + id); await db.set('deleted/' + id, 1); return { ok: 1 };
+    }
+    const old = await db.get('trash/' + kind + '/' + id); if (!old) return { err: 'Nothing to bring back.' };
+    if (kind === 'games') old.ts = Date.now();
+    await db.set(kind + '/' + id, old); await db.del('trash/' + kind + '/' + id); await db.del('deleted/' + id); return { ok: 1 };
+  }
+  return { err: 'Unknown admin action.' };
+};
 const PUBLIC = { enter: 1, pull: 1, search: 1 };
 
 const hits = {};
@@ -258,10 +357,15 @@ function handle(req, res) {
     let m; try { m = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (e) { return send(400, { err: 'Bad request.' }); }
     const f = m && ops[m.op]; if (!f) return send(400, { err: 'Unknown request.' });
     try {
-      let who = null;
-      if (!PUBLIC[m.op]) { who = checkToken(m.token); if (!who) return send(401, { err: 'login' }); }
-      send(200, await f(m, who));
+      let who = null, adm = 0;
+      if (!PUBLIC[m.op]) {
+        who = checkToken(m.token); if (!who) return send(401, { err: 'login' });
+        const inf = await acctInfo(who); if (!inf) return send(401, { err: 'login' });
+        if (inf.ban) return send(403, { err: 'This account is banned.', banned: 1 });
+        adm = inf.adm;
+      }
+      send(200, await f(m, who, adm));
     } catch (e) { console.log('api error', m.op, String(e && e.message || e)); send(500, { err: 'The server had a problem. Try again.' }); }
   });
 }
-module.exports = { handle, db, ops, checkToken, makeToken };
+module.exports = { handle, db, ops, checkToken, makeToken, authInfo, hooks };

@@ -31,6 +31,21 @@ function filterChat(text) {
   for (const w of BLOCKED) { if (w) out = out.replace(new RegExp(w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), '####'); }
   return out;
 }
+/* What a player looks like (colours and designs only). Anything else is dropped. */
+const HEX = /^#[0-9a-fA-F]{6}$/, WORD = /^[a-z]{1,12}$/;
+function int24(v) { v = Math.floor(Number(v)); return Number.isFinite(v) && v >= 0 && v <= 0xffffff ? v : 0; }
+function cleanLook(l) {
+  if (!l || typeof l !== 'object') return { v: 2 };
+  const o = { v: 2 };
+  ['shirt', 'sleeves', 'pants', 'pants2', 'hatColor'].forEach(k => { o[k] = int24(l[k]); });
+  o.hat = typeof l.hat === 'string' && WORD.test(l.hat) ? l.hat : false;
+  o.face = typeof l.face === 'string' && WORD.test(l.face) ? l.face : null;
+  const d = l.shirtD;
+  o.shirtD = d && typeof d === 'object' && HEX.test(String(d.col)) ? { k: clean(d.k, 10), col: d.col, dsn: WORD.test(String(d.dsn)) ? d.dsn : 'plain', ini: clean(d.ini, 1) } : null;
+  const p = l.pantsD;
+  o.pantsD = p && typeof p === 'object' && HEX.test(String(p.col)) ? { col: p.col, dsn: WORD.test(String(p.dsn)) ? p.dsn : 'plain' } : null;
+  return o;
+}
 function roomsFor(game) { return Array.from(rooms.values()).filter(r => r.game === game); }
 function listFor(game) { return roomsFor(game).map(r => ({ id: r.id, n: r.players.size, max: MAX_PLAYERS })); }
 function createRoom(game) {
@@ -66,8 +81,8 @@ function parseFrame(buf) {
 class Client {
   constructor(socket) {
     this.socket = socket; this.buf = Buffer.alloc(0); this.id = nextClientId++;
-    this.room = null; this.name = ''; this.look = { shirt: false, hat: false };
-    this.s = { x: 0, y: 0, z: 0, ry: 0, tool: '', mv: 0, air: 0 };
+    this.room = null; this.name = ''; this.key = ''; this.adm = 0; this.token = ''; this.joining = false; this.look = { v: 2 };
+    this.s = { x: 0, y: 0, z: 0, ry: 0, tool: '', tl: '', tc: '', mv: 0, air: 0 };
     this.parts = null; this.lastSeen = Date.now(); this.lastState = 0; this.lastChat = 0; this.dead = false;
     socket.setNoDelay(true);
     socket.on('data', d => this.onData(d));
@@ -103,12 +118,14 @@ class Client {
       return this.send({ t: 'servers', game, list: listFor(game), max: MAX_PLAYERS });
     }
     if (m.t === 'join') return this.join(m);
+    if (m.t === 'ban') return this.banPlayer(m);
     if (!this.room) return;
     if (m.t === 'state') {
       const now = Date.now(); if (now - this.lastState < 30) return; this.lastState = now;
       const s = this.s;
       s.x = num(m.x, -600, 600, s.x); s.y = num(m.y, -100, 300, s.y); s.z = num(m.z, -600, 600, s.z);
       s.ry = num(m.ry, -10, 10, s.ry); s.tool = ['sword', 'bow', 'torch'].includes(m.tool) ? m.tool : '';
+      s.tl = typeof m.tl === 'string' && WORD.test(m.tl) ? m.tl : ''; s.tc = typeof m.tc === 'string' && HEX.test(m.tc) ? m.tc : '';
       s.mv = m.mv ? 1 : 0; s.air = m.air ? 1 : 0;
     } else if (m.t === 'chat') {
       const now = Date.now(); if (now - this.lastChat < 800) return; this.lastChat = now;
@@ -116,10 +133,30 @@ class Client {
       this.broadcast({ t: 'chat', id: this.id, name: this.name, text });
     } else if (m.t === 'leave') { this.leave(); }
   }
-  join(m) {
-    const game = GAMES.includes(m.game) ? m.game : null;
-    if (!game) return this.send({ t: 'error', text: 'Unknown game.' });
-    const name = clean(m.name, 16).replace(/[^A-Za-z0-9_]/g, '');
+  async join(m) {
+    if (this.joining) return; this.joining = true;
+    try {
+      const game = GAMES.includes(m.game) ? m.game : null;
+      if (!game) return this.send({ t: 'error', text: 'Unknown game.' });
+      let who = null;
+      try { who = await api.authInfo(m.token); } catch (e) { return this.send({ t: 'error', text: 'The server could not check your login. Try again.' }); }
+      if (!who) return this.send({ t: 'error', text: 'Please log in online (or you may be banned) to play with others.' });
+      if (this.dead) return;
+      this.key = who.key; this.adm = who.adm; this.token = String(m.token);
+      this.joinRoom(m, game, who.name.replace(/[^A-Za-z0-9_]/g, ''));
+    } finally { this.joining = false; }
+  }
+  async banPlayer(m) {
+    if (!this.room) return;
+    let me = null; try { me = await api.authInfo(this.token); } catch (e) {}
+    if (!me || !me.adm) return this.send({ t: 'error', text: 'Only admins can ban.' });
+    const t = this.room && this.room.players.get(Number(m.id));
+    if (!t || !t.key) return this.send({ t: 'error', text: 'Player not found.' });
+    const r = await api.ops.admin({ action: 'ban', key: t.key }, me.key, me.adm);
+    if (r.err) return this.send({ t: 'error', text: r.err });
+    this.send({ t: 'banok', name: t.name });
+  }
+  joinRoom(m, game, name) {
     if (name.length < 1) return this.send({ t: 'error', text: 'Bad name.' });
     this.leave();
     let room = null;
@@ -131,7 +168,7 @@ class Client {
     }
     if (room.players.size >= MAX_PLAYERS) return this.send({ t: 'error', text: 'That server is full.' });
     this.name = name;
-    this.look = { shirt: !!(m.look && m.look.shirt), hat: !!(m.look && m.look.hat) };
+    this.look = cleanLook(m.look);
     this.room = room; room.players.set(this.id, this);
     const others = [];
     room.players.forEach(p => { if (p !== this) others.push(this.snapshot(p)); });
@@ -139,7 +176,7 @@ class Client {
     this.broadcast({ t: 'join', p: this.snapshot(this) });
     log(name + ' joined ' + game + ' #' + room.id + ' (' + room.players.size + '/' + MAX_PLAYERS + ')');
   }
-  snapshot(p) { return { id: p.id, name: p.name, look: p.look, x: p.s.x, y: p.s.y, z: p.s.z, ry: p.s.ry, tool: p.s.tool }; }
+  snapshot(p) { return { id: p.id, name: p.name, look: p.look, x: p.s.x, y: p.s.y, z: p.s.z, ry: p.s.ry, tool: p.s.tool, tl: p.s.tl, tc: p.s.tc }; }
   broadcast(obj) { if (this.room) this.room.players.forEach(p => { if (p !== this) p.send(obj); }); }
   leave() {
     const room = this.room; if (!room) return;
@@ -171,12 +208,13 @@ server.on('upgrade', (req, socket) => {
   const c = new Client(socket); clients.add(c); socket.on('close', () => clients.delete(c));
 });
 const clients = new Set();
+api.hooks.onBan = key => { clients.forEach(c => { if (c.key === key) { c.send({ t: 'banned' }); setTimeout(() => c.kill(), 400); } }); };
 
 setInterval(() => {
   rooms.forEach(room => {
     if (room.players.size < 2) return;
     const s = [];
-    room.players.forEach(p => s.push([p.id, +p.s.x.toFixed(2), +p.s.y.toFixed(2), +p.s.z.toFixed(2), +p.s.ry.toFixed(2), p.s.tool, p.s.mv, p.s.air]));
+    room.players.forEach(p => s.push([p.id, +p.s.x.toFixed(2), +p.s.y.toFixed(2), +p.s.z.toFixed(2), +p.s.ry.toFixed(2), p.s.tool, p.s.mv, p.s.air, p.s.tl, p.s.tc]));
     room.players.forEach(p => p.send({ t: 'peers', s }));
   });
 }, TICK_MS);
